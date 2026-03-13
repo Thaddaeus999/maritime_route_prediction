@@ -41,17 +41,38 @@ def ais_to_trajectory(filename, size, start, save_to):
     '''
     
     # read data from file
-    df = pd.read_csv(filename, delimiter=';', decimal='.')
+    
+    # read data in chunks to avoid memory crash from the original smaller dataset
+    chunk_list = []
+    for chunk in pd.read_csv(filename, delimiter=',', decimal='.', chunksize=500_000):
+        chunk.rename(columns={
+            'update_time': 'date_time_utc',
+            'nav_stat':    'nav_status',
+            'sog_ms':      'sog',
+            'cog_degree':  'cog'
+        }, inplace=True)
+        chunk_list.append(chunk)
+    df = pd.concat(chunk_list, ignore_index=True)
+    chunk_list = []  # free memory
+    
+    # alter the columnns
+    df.rename(columns={
+    'update_time': 'date_time_utc',
+    'nav_stat':    'nav_status',
+    'sog_ms':      'sog',
+    'cog_degree':  'cog' }, inplace=True)
+    
     n_messages = len(df)
     print(f'{n_messages} raw AIS messages loaded from file {filename}')
     
     # enrich with ship metadata
-    metadata_filename = '../../data/external/seilas-2022.csv'
+    metadata_filename = r"C:\Users\admin\Documents\maritime_route_prediction\data\meta_data_BEAN_cleaned.csv"
     df = add_ship_metadata(metadata_filename, df)
-    df['date_time_utc'] = pd.to_datetime(df['date_time_utc'])
+    df['date_time_utc'] = pd.to_datetime(df['date_time_utc'], utc=True)
     
     # convert to GeoDataFrame
-    gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.lon, df.lat), crs="EPSG:4326")
+    #gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.lon, df.lat), crs="EPSG:4326")
+    gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.eastin_m, df.northing_m), crs="EPSG:32632")
     df = []  # free memory
 
     # drop duplicate AIS data
@@ -59,15 +80,16 @@ def ais_to_trajectory(filename, size, start, save_to):
     #gdf.drop_duplicates(subset = ['mmsi', 'lat', 'lon'],
     #                keep = 'first', inplace=True)
     # filter for nav_status
-    nav_status_filter = [0, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, -99] # ships that are not moored, anchored or aground
-    filtered_gdf = gdf[gdf['nav_status'].isin(nav_status_filter)]
+    #nav_status_filter = [0, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, -99,99] # ships that are not moored, anchored or aground
+    #filtered_gdf = gdf[gdf['nav_status'].isin(nav_status_filter)]
+    filtered_gdf = gdf
     nav_filtered = len(filtered_gdf)
     # filter for duplicates (within 5 minutes)
-    duplicates = (filtered_gdf.duplicated(subset=['mmsi', 'lat', 'lon'], keep=False))
+    duplicates = (filtered_gdf.duplicated(subset=['mmsi', 'northing_m', 'eastin_m'], keep=False))
     duplicates_gdf = filtered_gdf[duplicates]
-    duplicates_gdf_sorted = duplicates_gdf.sort_values(by=['mmsi', 'lon', 'lat'])
+    duplicates_gdf_sorted = duplicates_gdf.sort_values(by=['mmsi', 'eastin_m', 'northing_m'])
     timeframe = timedelta(minutes=5)
-    duplicates_gdf_sorted['timeframe'] = duplicates_gdf_sorted.groupby(['mmsi', 'lon', 'lat'])['date_time_utc'].diff()
+    duplicates_gdf_sorted['timeframe'] = duplicates_gdf_sorted.groupby(['mmsi', 'eastin_m', 'northing_m'])['date_time_utc'].diff()
     to_be_deleted_gdf = duplicates_gdf_sorted[duplicates_gdf_sorted['timeframe'].lt(timeframe)]
     indices_to_be_deleted = to_be_deleted_gdf.index  # Get indices to be deleted
     filtered_gdf = filtered_gdf.drop(indices_to_be_deleted)  # Remove rows by index from filtered_gdf
@@ -105,8 +127,8 @@ def ais_to_trajectory(filename, size, start, save_to):
 
     # save to file    
     final_gdf = split_trajectories.to_point_gdf()
-    final_gdf['imo_nr'] = final_gdf['imo_nr'].astype(str)
-    final_gdf['length'] = final_gdf['length'].astype(str)
+    #final_gdf['imo_nr'] = final_gdf['imo_nr'].astype(str)
+    #final_gdf['length'] = final_gdf['length'].astype(str)
     final_gdf.to_parquet(save_to)
 
 def add_ship_metadata(filename, df, join_on='mmsi'):
@@ -122,14 +144,13 @@ def add_ship_metadata(filename, df, join_on='mmsi'):
     df: (dataframe) merged dataframe (including ship metadata)
     '''
     # load ship metadata from file
-    df_meta = pd.read_csv(filename, delimiter=';', decimal=',', encoding='ISO-8859-1')
-    df_meta.rename(columns={'mmsi_nummer':'mmsi'}, inplace=True)  # rename MMSI column
+    df_meta = pd.read_csv(filename, delimiter=',', decimal='.', encoding='utf-8')
+    #df_meta.rename(columns={'mmsi_nummer':'mmsi'}, inplace=True)  # rename MMSI column
     df_meta.drop_duplicates(subset='mmsi', inplace=True)  # drop duplicate MMSI's
     # merge dataframes on mmsi
-    merge_columns = ['mmsi', 'bredde', 'dypgaaende', 'skipstype', 'skipsgruppe', 'fartoynavn']
+    merge_columns = ['mmsi', 'fartoynavn', 'skipstype', 'skipsgruppe', 'dypgaaende', 'bredde']
     df = df.merge(df_meta[merge_columns], on='mmsi', how='left')
-    df['skipsgruppe'] = df['skipsgruppe'].replace(to_replace=['Last', 'Fisk', 'Passasjer', 'Slep'], 
-                                                  value=['Cargo', 'Fishing', 'Passenger', 'Tug'])
+    #df['skipsgruppe'] = df['skipsgruppe'].replace(to_replace=['Last', 'Fisk', 'Passasjer', 'Slep'], value=['Cargo', 'Fishing', 'Passenger', 'Tug'])
     df['skipsgruppe'].fillna('Unknown', inplace=True)
     
     # output report about join
